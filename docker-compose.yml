@@ -1,0 +1,198 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# docker-compose.yml — Production ML Pipeline Infrastructure
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Services:
+#   zookeeper   — Kafka cluster coordinator (metadata & leader election)
+#   kafka       — Message broker for ml-requests & ml-predictions topics
+#   ml-api      — FastAPI prediction service (model.pkl baked in)
+#   kafka-setup — One-shot container that creates Kafka topics on first run
+#
+# Network topology:
+#   All services share the 'ml-network' bridge network.
+#   Only ml-api exposes a port to the host (8000).
+#   Kafka is accessible internally at kafka:29092 (not exposed externally).
+#
+# Startup order (depends_on + healthchecks):
+#   zookeeper → kafka → kafka-setup → ml-api → kafka-client (manual)
+# ─────────────────────────────────────────────────────────────────────────────
+
+version: '3.8'
+
+networks:
+  ml-network:
+    driver: bridge
+    name: ml-pipeline-network
+
+volumes:
+  kafka-data:
+    name: ml-pipeline-kafka-data
+
+services:
+
+  # ── Zookeeper ──────────────────────────────────────────────────────────────
+  # Manages Kafka broker metadata, configuration, and leader election.
+  # Kafka 3.x supports KRaft mode (no Zookeeper), but Confluent images
+  # ship with Zookeeper for broader compatibility with this version.
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: zookeeper
+    hostname: zookeeper
+    networks:
+      - ml-network
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+      ZOOKEEPER_SYNC_LIMIT: 2
+      # Suppress excessive INFO logs in development
+      KAFKA_LOG4J_LOGGERS: "org.apache.zookeeper=WARN"
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo ruok | nc localhost 2181 | grep imok"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+
+  # ── Kafka Broker ───────────────────────────────────────────────────────────
+  # Single-broker setup for development. In production, run 3+ brokers
+  # across availability zones with replication factor = 3.
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka
+    hostname: kafka
+    networks:
+      - ml-network
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    environment:
+      # ── Broker identity ────────────────────────────────────────────────────
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+
+      # ── Listener config ────────────────────────────────────────────────────
+      # INTERNAL: inter-container communication on ml-network (port 29092)
+      # EXTERNAL: host machine access via localhost:9092 (for curl/testing)
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:9092
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:29092,EXTERNAL://0.0.0.0:9092
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+
+      # ── Topic defaults ─────────────────────────────────────────────────────
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"  # Explicit creation via kafka-setup
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1       # 1 for dev; 3 for production
+      KAFKA_NUM_PARTITIONS: 3                   # Allow 3 parallel consumers per topic
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+
+      # ── Retention ─────────────────────────────────────────────────────────
+      KAFKA_LOG_RETENTION_HOURS: 168            # 7-day message retention
+      KAFKA_LOG_SEGMENT_BYTES: 1073741824       # 1 GB segment size
+      KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS: 300000
+
+      # ── Performance ───────────────────────────────────────────────────────
+      KAFKA_MESSAGE_MAX_BYTES: 1048576          # 1 MB max message size
+      KAFKA_COMPRESSION_TYPE: gzip
+
+      # ── Logging ───────────────────────────────────────────────────────────
+      KAFKA_LOG4J_LOGGERS: "kafka=WARN,kafka.controller=WARN,kafka.log.LogCleaner=WARN,state.change.logger=WARN,kafka.producer.async.DefaultEventHandler=WARN"
+    ports:
+      - "9092:9092"   # Expose for host-side testing with kafka-python or kcat
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "kafka:29092"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+
+  # ── Kafka Topic Setup ──────────────────────────────────────────────────────
+  # One-shot init container that creates the required topics, then exits.
+  # Runs after Kafka is healthy; ml-api waits for this to complete.
+  kafka-setup:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka-setup
+    hostname: kafka-setup
+    networks:
+      - ml-network
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command: |
+      "
+      echo '>>> Creating Kafka topics...'
+
+      kafka-topics --create --if-not-exists \
+        --bootstrap-server kafka:29092 \
+        --replication-factor 1 \
+        --partitions 3 \
+        --topic ml-requests \
+        --config retention.ms=604800000 \
+        --config cleanup.policy=delete
+
+      kafka-topics --create --if-not-exists \
+        --bootstrap-server kafka:29092 \
+        --replication-factor 1 \
+        --partitions 3 \
+        --topic ml-predictions \
+        --config retention.ms=604800000 \
+        --config cleanup.policy=delete
+
+      echo '>>> Topics created successfully:'
+      kafka-topics --list --bootstrap-server kafka:29092
+
+      echo '>>> Topic details:'
+      kafka-topics --describe --bootstrap-server kafka:29092 --topic ml-requests
+      kafka-topics --describe --bootstrap-server kafka:29092 --topic ml-predictions
+      "
+    restart: on-failure
+
+
+  # ── ML Prediction API ──────────────────────────────────────────────────────
+  # FastAPI service with model.pkl baked in at build time.
+  # Waits for Kafka setup to complete before starting.
+  ml-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: ml-api
+    hostname: ml-api
+    networks:
+      - ml-network
+    depends_on:
+      kafka-setup:
+        condition: service_completed_successfully
+    ports:
+      - "8000:8000"   # Expose prediction API to host
+    environment:
+      MODEL_PATH: /app/model.pkl
+      METADATA_PATH: /app/model_metadata.json
+      SERVICE_VERSION: "1.0.0"
+      # Kafka config (used by kafka_client.py when run inside this container)
+      KAFKA_BROKER: kafka:29092
+      KAFKA_REQUEST_TOPIC: ml-requests
+      KAFKA_PREDICTION_TOPIC: ml-predictions
+      API_URL: http://ml-api:8000/predict
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import requests; r=requests.get('http://localhost:8000/health',timeout=5); exit(0 if r.json().get('status')=='healthy' else 1)"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    # Resource limits (adjust for your host machine)
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1.0"
+        reservations:
+          memory: 256M
+          cpus: "0.25"
